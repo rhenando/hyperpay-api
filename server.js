@@ -56,7 +56,10 @@ const WIDGET_ORIGIN =
 const ACCESS_TOKEN = process.env.HYPERPAY_ACCESS_TOKEN;
 const ENTITY_ID = process.env.HYPERPAY_ENTITY_ID;
 const CURRENCY = process.env.CURRENCY || "SAR";
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
+const FRONTEND_URL =
+  process.env.FRONTEND_URL ||
+  "https://marsos.vercel.app/" ||
+  "http://localhost:3000";
 
 // ── Healthcheck ─────────────────────────────────────────────
 app.get("/", (_req, res) => {
