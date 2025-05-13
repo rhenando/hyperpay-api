@@ -6,15 +6,9 @@ const axios = require("axios");
 const cors = require("cors");
 const helmet = require("helmet");
 const admin = require("firebase-admin");
+const serviceAccount = require("./serviceAccountKey.json");
 
-// ── Load GCP Service Account from ENV ────────────────────────
-if (!process.env.GCP_SERVICE_ACCOUNT_JSON) {
-  console.error("❌ GCP_SERVICE_ACCOUNT_JSON is missing");
-  process.exit(1);
-}
-const serviceAccount = JSON.parse(process.env.GCP_SERVICE_ACCOUNT_JSON);
-
-// ── Initialize Firebase Admin ────────────────────────────────
+// Initialize Firebase Admin
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
@@ -23,26 +17,6 @@ const db = admin.firestore();
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// ── Security headers ─────────────────────────────────────────
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use((req, res, next) => {
-  const widgetOrigin =
-    process.env.HYPERPAY_ENV === "prod"
-      ? "https://eu-prod.oppwa.com"
-      : "https://eu-test.oppwa.com";
-  res.setHeader(
-    "Content-Security-Policy",
-    [
-      "default-src 'self'",
-      `script-src 'self' 'unsafe-inline' 'unsafe-eval' ${widgetOrigin}`,
-      `connect-src 'self' ${widgetOrigin}`,
-      `frame-src 'self' ${widgetOrigin}`,
-      "img-src 'self' data: https://*",
-    ].join("; ")
-  );
-  next();
-});
 
 const PORT = process.env.PORT || 5002;
 const BASE_URL =
@@ -58,14 +32,28 @@ const ENTITY_ID = process.env.HYPERPAY_ENTITY_ID;
 const CURRENCY = process.env.CURRENCY || "SAR";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
 
-// ── Healthcheck ─────────────────────────────────────────────
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use((req, res, next) => {
+  res.setHeader(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      `script-src 'self' 'unsafe-inline' 'unsafe-eval' ${WIDGET_ORIGIN}`,
+      `connect-src 'self' ${WIDGET_ORIGIN}`,
+      `frame-src 'self' ${WIDGET_ORIGIN}`,
+      "img-src 'self' data: https://*",
+    ].join("; ")
+  );
+  next();
+});
+
 app.get("/", (_req, res) => {
   res.send(
     `✅ HyperPay backend (${process.env.HYPERPAY_ENV || "test"}) running.`
   );
 });
 
-// ── 1️⃣ Create checkout session ─────────────────────────────
+// 1️⃣ Create checkout session
 app.post("/api/create-checkout", async (req, res) => {
   const { amount, email, name, street, city, state, country, postcode } =
     req.body;
@@ -74,7 +62,6 @@ app.post("/api/create-checkout", async (req, res) => {
       .status(400)
       .json({ error: "Missing required fields: name or amount" });
   }
-
   const data = new URLSearchParams({
     entityId: ENTITY_ID,
     amount: parseFloat(amount).toFixed(2),
@@ -118,7 +105,7 @@ app.post("/api/create-checkout", async (req, res) => {
   }
 });
 
-// ── 2️⃣ Shopper-result: verify once, persist order, clear cart, redirect ───
+// 2️⃣ Shopper-result: verify once, persist order, clear cart, redirect
 app.get("/api/payment-status", async (req, res) => {
   const { resourcePath, userId, supplierId } = req.query;
   if (!resourcePath || !userId || !supplierId) {
@@ -154,7 +141,25 @@ app.get("/api/payment-status", async (req, res) => {
       .where("supplierId", "==", supplierId)
       .get();
 
-    const items = cartSnap.docs.map((doc) => doc.data());
+    const items = cartSnap.docs.map((doc) => {
+      const d = doc.data();
+      return {
+        addedAt: d.addedAt ?? null,
+        buyerId: d.buyerId ?? null,
+        cartId: d.cartId ?? null,
+        color: d.color ?? null,
+        deliveryLocation: d.deliveryLocation ?? null,
+        mainImageUrl: d.mainImageUrl ?? null,
+        name: d.name ?? null,
+        price: d.price ?? null,
+        productId: d.productId ?? null,
+        quantity: d.quantity ?? null,
+        shippingCost: d.shippingCost ?? null,
+        size: d.size ?? null,
+        supplierId: d.supplierId ?? null,
+        supplierName: d.supplierName ?? null,
+      };
+    });
 
     // Persist the order
     const orderId = data.id;
@@ -177,7 +182,7 @@ app.get("/api/payment-status", async (req, res) => {
 
     // Clear cart items
     const batch = db.batch();
-    cartSnap.docs.forEach((d) => batch.delete(d.ref));
+    cartSnap.docs.forEach((doc) => batch.delete(doc.ref));
     await batch.commit();
 
     // Redirect to order-details
@@ -190,7 +195,7 @@ app.get("/api/payment-status", async (req, res) => {
   }
 });
 
-// ── (Optional) verify-payment endpoint ───────────────────────
+// (Optional) keep or remove this
 app.post("/api/verify-payment", async (req, res) => {
   const { resourcePath } = req.body;
   if (!resourcePath) {
