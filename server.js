@@ -1,36 +1,31 @@
-// server.js
-require("dotenv").config();
+// server.js  (or wherever your Express code lives)
 
+require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const helmet = require("helmet");
 const admin = require("firebase-admin");
 
-// ── Load GCP Service Account from ENV ────────────────────────
-if (!process.env.GCP_SERVICE_ACCOUNT_JSON) {
-  console.error("❌ GCP_SERVICE_ACCOUNT_JSON is missing");
-  process.exit(1);
-}
-const serviceAccount = JSON.parse(process.env.GCP_SERVICE_ACCOUNT_JSON);
+// ── Load GCP Service Account (local file)
+const serviceAccount = require("./serviceAccountKey.json");
 
 // ── Initialize Firebase Admin ────────────────────────────────
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Security headers ─────────────────────────────────────────
-app.use(helmet({ contentSecurityPolicy: false }));
+// ── Security headers (production) ────────────────────────────
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+  })
+);
 app.use((req, res, next) => {
-  const widgetOrigin =
-    process.env.HYPERPAY_ENV === "prod"
-      ? "https://eu-prod.oppwa.com"
-      : "https://eu-test.oppwa.com";
+  const widgetOrigin = "https://eu-prod.oppwa.com";
   res.setHeader(
     "Content-Security-Policy",
     [
@@ -44,41 +39,45 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Configurable variables ───────────────────────────────────
 const PORT = process.env.PORT || 5002;
-const BASE_URL =
-  process.env.HYPERPAY_ENV === "prod"
-    ? "https://eu-prod.oppwa.com/v1/checkouts"
-    : "https://eu-test.oppwa.com/v1/checkouts";
-const WIDGET_ORIGIN =
-  process.env.HYPERPAY_ENV === "prod"
-    ? "https://eu-prod.oppwa.com"
-    : "https://eu-test.oppwa.com";
+const CHECKOUT_BASE = "https://eu-prod.oppwa.com/v1/checkouts";
+const WIDGET_ORIGIN = "https://eu-prod.oppwa.com";
 const ACCESS_TOKEN = process.env.HYPERPAY_ACCESS_TOKEN;
-const ENTITY_ID = process.env.HYPERPAY_ENTITY_ID;
+const ENTITY_ID = (process.env.HYPERPAY_ENTITY_ID || "").trim();
 const CURRENCY = process.env.CURRENCY || "SAR";
-const FRONTEND_URL =
-  process.env.FRONTEND_URL ||
-  "https://marsos.vercel.app/" ||
-  "http://localhost:3000";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://marsos.sa";
 
 // ── Healthcheck ─────────────────────────────────────────────
-app.get("/", (_req, res) => {
-  res.send(
-    `✅ HyperPay backend (${process.env.HYPERPAY_ENV || "test"}) running.`
-  );
-});
+app.get("/", (_req, res) =>
+  res.send("✅ HyperPay backend (production) running.")
+);
 
-// ── 1️⃣ Create checkout session ─────────────────────────────
+// ── Create checkout session ──────────────────────────────────
 app.post("/api/create-checkout", async (req, res) => {
   const { amount, email, name, street, city, state, country, postcode } =
     req.body;
+
+  // 1) Quick sanity‐check logging:
+  console.log("↪︎ /api/create-checkout called with:");
+  console.log("   • name:", name);
+  console.log("   • amount:", amount);
+  console.log("   • ENTITY_ID (server sees):", JSON.stringify(ENTITY_ID));
+
   if (!name || !amount) {
     return res
       .status(400)
       .json({ error: "Missing required fields: name or amount" });
   }
 
-  const data = new URLSearchParams({
+  if (!ENTITY_ID) {
+    return res
+      .status(500)
+      .json({ error: "HyperPay entity ID is not defined on the server." });
+  }
+
+  // 2) Build URLSearchParams exactly as HyperPay expects:
+  const params = new URLSearchParams({
     entityId: ENTITY_ID,
     amount: parseFloat(amount).toFixed(2),
     currency: CURRENCY,
@@ -98,30 +97,39 @@ app.post("/api/create-checkout", async (req, res) => {
     "standingInstruction.type": "UNSCHEDULED",
   });
 
-  console.log("📤 Sending to HyperPay:", Object.fromEntries(data.entries()));
-
   try {
-    const { data: resp } = await axios.post(BASE_URL, data, {
+    const { data: resp } = await axios.post(CHECKOUT_BASE, params, {
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         Authorization: `Bearer ${ACCESS_TOKEN}`,
       },
     });
-    console.log("✅ HyperPay Response:", resp);
-    if (resp.id) return res.json({ checkoutId: resp.id });
+
+    console.log(
+      "↪︎ HyperPay response:",
+      JSON.stringify(resp).slice(0, 200) + "..."
+    );
+
+    if (resp.id) {
+      return res.json({ checkoutId: resp.id });
+    }
+
     return res
       .status(500)
       .json({ error: "No checkoutId returned", details: resp });
   } catch (err) {
     const details = err.response?.data || err.message;
-    console.error("❌ HyperPay Error:", details);
+    console.error(
+      "‼️  HyperPay create-checkout failed:",
+      JSON.stringify(details)
+    );
     return res
       .status(500)
       .json({ error: "Failed to create checkout", details });
   }
 });
 
-// ── 2️⃣ Shopper-result: verify once, persist order, clear cart, redirect ───
+// ── Payment-status & order persistence ───────────────────────
 app.get("/api/payment-status", async (req, res) => {
   const { resourcePath, userId, supplierId } = req.query;
   if (!resourcePath || !userId || !supplierId) {
@@ -131,35 +139,31 @@ app.get("/api/payment-status", async (req, res) => {
   }
 
   try {
-    // Fetch HyperPay status
     const { data } = await axios.get(
       `${WIDGET_ORIGIN}${resourcePath}?entityId=${ENTITY_ID}`,
       { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
     );
-    console.log("✅ Payment Status Response:", data);
 
-    const code = data.result.code;
-    const desc = data.result.description;
+    const { code, description } = data.result;
     const successCodes = ["000.000.000", "000.100.110", "000.100.112"];
     if (!successCodes.includes(code)) {
       return res.redirect(
-        `${FRONTEND_URL}/payment-failed` +
-          `?error=${encodeURIComponent(code)}` +
-          `&message=${encodeURIComponent(desc)}`
+        `${FRONTEND_URL}/payment-failed?error=${encodeURIComponent(
+          code
+        )}&message=${encodeURIComponent(description)}`
       );
     }
 
-    // Load cart items for this user & supplier
+    // Fetch cart items
     const cartSnap = await db
       .collection("carts")
       .doc(userId)
       .collection("items")
       .where("supplierId", "==", supplierId)
       .get();
+    const items = cartSnap.docs.map((d) => d.data());
 
-    const items = cartSnap.docs.map((doc) => doc.data());
-
-    // Persist the order
+    // Persist order
     const orderId = data.id;
     await db
       .collection("orders")
@@ -167,33 +171,30 @@ app.get("/api/payment-status", async (req, res) => {
       .set({
         transactionId: orderId,
         orderStatus: "Paid",
-        paymentMethod: data.paymentType ?? null,
-        totalAmount: (data.amount ?? 0).toString(),
-        cardBrand: data.card?.brand ?? "N/A",
+        paymentMethod: data.paymentType,
+        totalAmount: data.amount.toString(),
+        cardBrand: data.card?.brand || "N/A",
         userId,
-        userEmail: data.customer?.email ?? null,
-        userName: data.customer?.givenName ?? null,
-        buyerId: userId,
+        userEmail: data.customer?.email,
+        userName: data.customer?.givenName,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         items,
       });
 
-    // Clear cart items
+    // Clear cart
     const batch = db.batch();
-    cartSnap.docs.forEach((d) => batch.delete(d.ref));
+    cartSnap.docs.forEach((doc) => batch.delete(doc.ref));
     await batch.commit();
 
-    // Redirect to order-details
     return res.redirect(
       `${FRONTEND_URL}/order-details/${orderId}?supplierId=${supplierId}`
     );
   } catch (err) {
-    console.error("❌ Error in payment-status:", err.response?.data || err);
     return res.status(500).send("Error verifying payment");
   }
 });
 
-// ── (Optional) verify-payment endpoint ───────────────────────
+// ── Verify payment endpoint (optional) ───────────────────────
 app.post("/api/verify-payment", async (req, res) => {
   const { resourcePath } = req.body;
   if (!resourcePath) {
@@ -201,35 +202,28 @@ app.post("/api/verify-payment", async (req, res) => {
       .status(400)
       .json({ success: false, error: "Missing resourcePath" });
   }
+
   try {
     const { data } = await axios.get(
       `${WIDGET_ORIGIN}${resourcePath}?entityId=${ENTITY_ID}`,
       { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
     );
-    console.log("✅ Verify Payment Response:", data);
     return res.json({
       success: true,
       transactionId: data.id,
       amount: data.amount,
       paymentType: data.paymentType,
-      cardBrand: data.card?.brand ?? null,
-      customerName: data.customer?.givenName ?? null,
-      customerEmail: data.customer?.email ?? null,
+      cardBrand: data.card?.brand || null,
+      customerName: data.customer?.givenName || null,
+      customerEmail: data.customer?.email || null,
       billing: data.billing || {},
       resourcePath,
     });
   } catch (err) {
-    console.error("❌ Error in verify-payment:", err.response?.data || err);
     return res
       .status(500)
       .json({ success: false, error: "Verification failed" });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(
-    `✅ HyperPay server (${
-      process.env.HYPERPAY_ENV || "test"
-    }) listening on ${PORT}`
-  );
-});
+app.listen(PORT, () => console.log(`✅ HyperPay server listening on ${PORT}`));
