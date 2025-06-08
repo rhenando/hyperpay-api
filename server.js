@@ -105,10 +105,7 @@ app.post("/api/create-checkout", async (req, res) => {
       },
     });
 
-    console.log(
-      "↪︎ HyperPay response:",
-      JSON.stringify(resp).slice(0, 200) + "..."
-    );
+    console.log("↪︎ HyperPay full response:", JSON.stringify(resp, null, 2));
 
     if (resp.id) {
       return res.json({ checkoutId: resp.id });
@@ -144,7 +141,14 @@ app.get("/api/payment-status", async (req, res) => {
       { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } }
     );
 
+    console.log("↪︎ Verifying payment with resourcePath:", resourcePath);
+    console.log(
+      "↪︎ Full verification response:",
+      JSON.stringify(data, null, 2)
+    );
+
     const { code, description } = data.result;
+
     const successCodes = ["000.000.000", "000.100.110", "000.100.112"];
     if (!successCodes.includes(code)) {
       return res.redirect(
